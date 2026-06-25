@@ -29,7 +29,7 @@ app.get("/health", (_, res) => {
   res.json({
     ok: true,
     service: "social-saver-worker",
-    engine: "yt-dlp + ffmpeg",
+    engine: "yt-dlp + ffmpeg + deno",
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
     photoTypes: PHOTO_TYPES
@@ -40,6 +40,8 @@ app.use("/files", express.static(downloadDir, {
   setHeaders: (res, filePath) => {
     res.setHeader("content-disposition", `attachment; filename="${basename(filePath)}"`)
     res.setHeader("cache-control", "no-store")
+    res.setHeader("access-control-allow-origin", "*")
+    res.setHeader("cross-origin-resource-policy", "cross-origin")
   }
 }))
 
@@ -105,6 +107,23 @@ app.post("/api/download", async (req, res) => {
   }
 })
 
+
+function ytDlpBaseArgs(outputTemplate) {
+  return [
+    "--no-playlist",
+    "--restrict-filenames",
+    "--windows-filenames",
+    "--newline",
+    "--retries", "3",
+    "--fragment-retries", "3",
+    "--sleep-requests", "1",
+    "--sleep-interval", "1",
+    "--max-sleep-interval", "3",
+    "--js-runtimes", "deno",
+    "--output", outputTemplate
+  ]
+}
+
 async function processVideo({ url, jobId, quality, fileType }) {
   const sourceTemplate = join(downloadDir, `${jobId}-source.%(ext)s`)
   const maxHeight = parseVideoHeight(quality)
@@ -113,14 +132,11 @@ async function processVideo({ url, jobId, quality, fileType }) {
     : "bestvideo+bestaudio/best"
 
   await mustRun("yt-dlp", [
-    "--no-playlist",
-    "--restrict-filenames",
-    "--windows-filenames",
-    "--output", sourceTemplate,
+    ...ytDlpBaseArgs(sourceTemplate),
     "--format", selector,
     "--merge-output-format", "mp4",
     url
-  ], 260000)
+  ], 300000)
 
   const source = findFile(`${jobId}-source`)
   if (!source) return null
@@ -140,15 +156,12 @@ async function processAudio({ url, jobId, quality, fileType }) {
   const sourceTemplate = join(downloadDir, `${jobId}-audio.%(ext)s`)
 
   await mustRun("yt-dlp", [
-    "--no-playlist",
-    "--restrict-filenames",
-    "--windows-filenames",
-    "--output", sourceTemplate,
+    ...ytDlpBaseArgs(sourceTemplate),
     "--extract-audio",
     "--audio-format", preferredYtDlpAudioFormat(fileType),
     "--audio-quality", "0",
     url
-  ], 260000)
+  ], 300000)
 
   const source = findFile(`${jobId}-audio`)
   if (!source) return null
@@ -180,14 +193,11 @@ async function processPhoto({ url, jobId, quality, fileType }) {
   const sourceTemplate = join(downloadDir, `${jobId}-photo.%(ext)s`)
 
   await mustRun("yt-dlp", [
-    "--no-playlist",
-    "--restrict-filenames",
-    "--windows-filenames",
+    ...ytDlpBaseArgs(sourceTemplate),
     "--skip-download",
     "--write-thumbnail",
-    "--output", sourceTemplate,
     url
-  ], 180000)
+  ], 220000)
 
   const source = findFile(`${jobId}-photo`)
   if (!source) return null
@@ -410,6 +420,14 @@ function safeRemove(filePath) {
 
 function simplifyError(message) {
   const text = String(message || "").replace(/\s+/g, " ").trim()
+
+  if (text.includes("HTTP Error 429") || text.toLowerCase().includes("too many requests")) {
+    return "YouTube membatasi request dari IP worker. Tunggu beberapa menit, coba quality lebih rendah, atau deploy worker di server/IP lain."
+  }
+
+  if (text.toLowerCase().includes("javascript runtime") || text.toLowerCase().includes("js runtime")) {
+    return "Worker belum menemukan runtime JavaScript. Deploy ulang worker versi terbaru yang sudah memasang Deno."
+  }
 
   if (text.includes("Unsupported URL")) {
     return "Platform atau link belum didukung oleh engine."
