@@ -1,56 +1,80 @@
-# Social Saver Worker
+# MenGinaSV Worker
 
-Worker untuk proses download dan convert.
+Worker downloader untuk Railway/VPS.
 
-## Endpoint
-
-```http
-POST /api/download
-```
-
-Body:
-
-```json
-{
-  "url": "https://...",
-  "platform": "youtube",
-  "mediaGroup": "video",
-  "quality": "1080p",
-  "fileType": "mp4"
-}
-```
-
-## Deploy Railway
-
-Deploy folder `worker` ke Railway.
-
-Set environment variables:
+## ENV wajib
 
 ```env
-WORKER_TOKEN=token-yang-sama
-PUBLIC_BASE_URL=https://nama-worker-kamu.up.railway.app
+WORKER_TOKEN=token-kamu
+PUBLIC_BASE_URL=https://domain-worker-kamu.up.railway.app
 ```
 
-Masukkan ini ke Vercel:
+## ENV optional untuk YouTube bot verification
 
-```env
-DOWNLOADER_WORKER_URL=https://nama-worker-kamu.up.railway.app/api/download
-DOWNLOADER_WORKER_TOKEN=token-yang-sama
-```
-
-## Worker Deno Fix v3.0.2
-
-Versi ini memperbaiki warning:
+YouTube kadang menolak request dari IP server dan menampilkan:
 
 ```text
-No supported JavaScript runtime could be found
+Sign in to confirm you’re not a bot
+Use --cookies-from-browser or --cookies
 ```
 
-Perubahan:
-- Dockerfile memasang Deno.
-- yt-dlp dipasang dengan `yt-dlp[default]`.
-- command yt-dlp memakai `--js-runtimes deno`.
-- retry ringan dan sleep request ditambahkan.
-- error 429 dibuat lebih jelas.
+Worker ini support cookies lewat Railway Variables.
 
-Jika masih muncul HTTP 429, artinya IP Railway worker sedang dibatasi oleh YouTube. Tunggu beberapa menit, coba kualitas lebih rendah, atau deploy worker di server/IP lain.
+### Cara aman pakai cookies
+
+1. Export cookies YouTube dari browser kamu ke format `cookies.txt`.
+2. Jangan upload cookies ke GitHub.
+3. Convert isi file cookies ke base64.
+4. Masukkan ke Railway Variables:
+
+```env
+YOUTUBE_COOKIES_B64=hasil_base64_cookies_txt
+```
+
+Worker akan decode otomatis ke:
+
+```text
+downloads/youtube-cookies.txt
+```
+
+Lalu yt-dlp otomatis memakai:
+
+```bash
+--cookies downloads/youtube-cookies.txt
+```
+
+## Cara convert cookies.txt ke base64
+
+Windows PowerShell:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt")) | Set-Clipboard
+```
+
+Mac/Linux:
+
+```bash
+base64 -w 0 cookies.txt
+```
+
+Jika di Mac command `-w` error:
+
+```bash
+base64 cookies.txt | tr -d '\n'
+```
+
+## Cek worker
+
+```text
+https://domain-worker-kamu.up.railway.app/health
+```
+
+Kalau cookies aktif, response health memuat:
+
+```json
+"cookiesEnabled": true
+```
+
+## Catatan keamanan
+
+Cookies adalah sesi login. Jangan commit ke GitHub. Jangan pakai akun utama untuk layanan publik. Cookies bisa kedaluwarsa, jadi perlu diganti ulang jika error muncul lagi.

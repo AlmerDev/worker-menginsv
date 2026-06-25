@@ -12,6 +12,7 @@ const PORT = process.env.PORT || 8080
 const __dirname = fileURLToPath(new URL(".", import.meta.url))
 const rootDir = join(__dirname, "..")
 const downloadDir = join(rootDir, "downloads")
+const generatedCookiesPath = join(downloadDir, "youtube-cookies.txt")
 
 const VIDEO_TYPES = ["mp4", "webm", "mkv", "mov", "avi", "m4v", "3gp", "flv"]
 const AUDIO_TYPES = ["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "webm"]
@@ -20,6 +21,8 @@ const PHOTO_TYPES = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "avif"]
 if (!existsSync(downloadDir)) {
   mkdirSync(downloadDir, { recursive: true })
 }
+
+prepareCookiesFromEnv()
 
 app.use(helmet({ crossOriginResourcePolicy: false }))
 app.use(cors())
@@ -30,6 +33,7 @@ app.get("/health", (_, res) => {
     ok: true,
     service: "social-saver-worker",
     engine: "yt-dlp + ffmpeg + deno",
+    cookiesEnabled: Boolean(getCookiesPath()),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
     photoTypes: PHOTO_TYPES
@@ -109,7 +113,7 @@ app.post("/api/download", async (req, res) => {
 
 
 function ytDlpBaseArgs(outputTemplate) {
-  return [
+  const args = [
     "--no-playlist",
     "--restrict-filenames",
     "--windows-filenames",
@@ -122,6 +126,14 @@ function ytDlpBaseArgs(outputTemplate) {
     "--js-runtimes", "deno",
     "--output", outputTemplate
   ]
+
+  const cookiesPath = getCookiesPath()
+
+  if (cookiesPath) {
+    args.push("--cookies", cookiesPath)
+  }
+
+  return args
 }
 
 async function processVideo({ url, jobId, quality, fileType }) {
@@ -433,6 +445,14 @@ function simplifyError(message) {
     return "Platform atau link belum didukung oleh engine."
   }
 
+  if (text.toLowerCase().includes("sign in to confirm") || text.toLowerCase().includes("not a bot")) {
+    return "YouTube meminta verifikasi login karena IP worker terdeteksi seperti bot. Isi YOUTUBE_COOKIES_B64 di Railway atau coba deploy worker di server/IP lain."
+  }
+
+  if (text.toLowerCase().includes("cookies-from-browser") || text.toLowerCase().includes("--cookies")) {
+    return "YouTube meminta cookies login. Worker ini sudah support YOUTUBE_COOKIES_B64, tapi cookies belum dipasang atau sudah kedaluwarsa."
+  }
+
   if (text.toLowerCase().includes("login") || text.toLowerCase().includes("private")) {
     return "Konten private atau butuh login tidak bisa diproses."
   }
@@ -446,6 +466,40 @@ function simplifyError(message) {
   }
 
   return text.slice(0, 240) || "Download gagal."
+}
+
+
+function prepareCookiesFromEnv() {
+  const raw = process.env.YOUTUBE_COOKIES_B64
+
+  if (!raw) return
+
+  try {
+    const decoded = Buffer.from(raw, "base64").toString("utf-8")
+
+    if (decoded.includes("# Netscape HTTP Cookie File") || decoded.includes(".youtube.com")) {
+      writeFileSync(generatedCookiesPath, decoded, { mode: 0o600 })
+      console.log("YouTube cookies loaded from YOUTUBE_COOKIES_B64")
+    } else {
+      console.warn("YOUTUBE_COOKIES_B64 exists but does not look like a cookies.txt file.")
+    }
+  } catch {
+    console.warn("Failed to decode YOUTUBE_COOKIES_B64.")
+  }
+}
+
+function getCookiesPath() {
+  const explicitPath = process.env.YTDLP_COOKIES_PATH
+
+  if (explicitPath && existsSync(explicitPath)) {
+    return explicitPath
+  }
+
+  if (existsSync(generatedCookiesPath)) {
+    return generatedCookiesPath
+  }
+
+  return null
 }
 
 app.listen(PORT, () => {
