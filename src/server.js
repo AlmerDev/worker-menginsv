@@ -32,7 +32,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "type-aware cobalt + music/audio routing + picker + local-processing + direct-file + yt-dlp + ffmpeg + deno",
+    engine: "universal music resolver + type-aware cobalt + picker + local-processing + direct-file + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
@@ -99,33 +99,21 @@ app.post("/api/download", async (req, res) => {
     const jobId = nanoid(10)
     let outputFile = null
 
-    if (!directType && isTikTokMusicUrl(url)) {
-      const resolvedVideoUrl = await resolveTikTokMusicToVideoUrl(url)
+    if (!directType && isAudioOnlyPageUrl(url)) {
+      const musicResult = await processMusicPage({
+        req,
+        originalUrl: url,
+        quality,
+        fileType,
+        jobId
+      })
 
-      if (resolvedVideoUrl) {
-        const resolvedCobalt = await tryCobalt({
-          req,
-          url: resolvedVideoUrl,
-          mediaGroup: "audio",
-          quality,
-          fileType
-        })
+      if (musicResult?.ok) {
+        return res.json(musicResult)
+      }
 
-        if (resolvedCobalt?.ok) {
-          return res.json({
-            ...resolvedCobalt,
-            title: resolvedCobalt.title || `tiktok-music-${Date.now()}.${fileType}`,
-            mediaGroup: "audio"
-          })
-        }
-
-        outputFile = await processWithYtDlp({
-          url: resolvedVideoUrl,
-          jobId,
-          mediaGroup: "audio",
-          quality,
-          fileType
-        })
+      if (musicResult?.outputFile) {
+        outputFile = musicResult.outputFile
       }
     }
 
@@ -738,8 +726,14 @@ function isPrivateHost(hostname) {
   )
 }
 
+
 function isAudioOnlyPageUrl(value) {
-  return isTikTokMusicUrl(value) || isYouTubeMusicUrl(value) || isSoundCloudUrl(value)
+  return isTikTokMusicUrl(value) ||
+    isYouTubeMusicUrl(value) ||
+    isSoundCloudUrl(value) ||
+    isInstagramAudioUrl(value) ||
+    isSpotifyUrl(value) ||
+    isAppleMusicUrl(value)
 }
 
 function isTikTokMusicUrl(value) {
@@ -769,33 +763,324 @@ function isSoundCloudUrl(value) {
   }
 }
 
-async function resolveTikTokMusicToVideoUrl(value) {
+function isInstagramAudioUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.hostname.includes("instagram.com") &&
+      (parsed.pathname.includes("/reels/audio/") || parsed.pathname.includes("/audio/"))
+  } catch {
+    return false
+  }
+}
+
+function isSpotifyUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.hostname.includes("spotify.com")
+  } catch {
+    return false
+  }
+}
+
+function isAppleMusicUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.hostname.includes("music.apple.com")
+  } catch {
+    return false
+  }
+}
+
+async function processMusicPage({ req, originalUrl, quality, fileType, jobId }) {
+  const normalizedUrl = normalizeMusicUrl(originalUrl)
+  const candidateUrls = await resolveMusicCandidates(normalizedUrl)
+
+  for (const candidateUrl of candidateUrls) {
+    const directType = detectDirectMedia(candidateUrl)
+
+    const cobaltResult = await tryCobalt({
+      req,
+      url: candidateUrl,
+      mediaGroup: "audio",
+      quality,
+      fileType
+    })
+
+    if (cobaltResult?.ok) {
+      return {
+        ...cobaltResult,
+        title: cobaltResult.title || `music-${Date.now()}.${fileType}`,
+        mediaGroup: "audio",
+        fileType
+      }
+    }
+
+    try {
+      if (directType) {
+        const outputFile = await processDirectMedia({
+          url: candidateUrl,
+          jobId: `${jobId}-music`,
+          mediaGroup: "audio",
+          fileType
+        })
+
+        if (outputFile) return { outputFile }
+      }
+
+      if (!isNonDownloadableMusicPage(candidateUrl)) {
+        const outputFile = await processWithYtDlp({
+          url: candidateUrl,
+          jobId: `${jobId}-music`,
+          mediaGroup: "audio",
+          quality,
+          fileType
+        })
+
+        if (outputFile) return { outputFile }
+      }
+    } catch {
+      // Try next candidate.
+    }
+  }
+
+  return null
+}
+
+function normalizeMusicUrl(value) {
+  if (isYouTubeMusicUrl(value)) {
+    try {
+      const parsed = new URL(value)
+      const videoId = parsed.searchParams.get("v")
+      if (videoId) return `https://www.youtube.com/watch?v=${videoId}`
+    } catch {
+      return value
+    }
+  }
+
+  return value
+}
+
+function isNonDownloadableMusicPage(value) {
+  return isSpotifyUrl(value) || isAppleMusicUrl(value)
+}
+
+async function resolveMusicCandidates(value) {
+  const candidates = []
+  const normalized = normalizeMusicUrl(value)
+
+  addCandidate(candidates, normalized)
+
+  const externalCandidates = await resolveWithExternalMusicApi(normalized)
+  for (const item of externalCandidates) addCandidate(candidates, item)
+
+  if (isTikTokMusicUrl(normalized)) {
+    const tiktokCandidates = await resolveTikTokMusicCandidates(normalized)
+    for (const item of tiktokCandidates) addCandidate(candidates, item)
+  }
+
+  if (isInstagramAudioUrl(normalized)) {
+    const instagramCandidates = await resolveInstagramAudioCandidates(normalized)
+    for (const item of instagramCandidates) addCandidate(candidates, item)
+  }
+
+  return candidates
+}
+
+function addCandidate(candidates, value) {
+  if (!value) return
+  if (!candidates.includes(value)) candidates.push(value)
+}
+
+async function resolveWithExternalMusicApi(value) {
+  const apiUrl = process.env.MUSIC_RESOLVER_API_URL
+  if (!apiUrl) return []
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(process.env.MUSIC_RESOLVER_API_KEY ? { authorization: `Bearer ${process.env.MUSIC_RESOLVER_API_KEY}` } : {})
+      },
+      body: JSON.stringify({ url: value })
+    })
+
+    const data = await response.json().catch(() => null)
+
+    if (!response.ok || !data) return []
+
+    if (typeof data.url === "string") return [data.url]
+    if (Array.isArray(data.urls)) return data.urls.filter((item) => typeof item === "string")
+    if (typeof data.audioUrl === "string") return [data.audioUrl]
+    if (Array.isArray(data.audioUrls)) return data.audioUrls.filter((item) => typeof item === "string")
+
+    return []
+  } catch {
+    return []
+  }
+}
+
+async function resolveTikTokMusicCandidates(value) {
+  const candidates = []
+  const musicId = extractTikTokMusicId(value)
+
+  if (musicId) {
+    const apiCandidates = await resolveTikTokMusicFromApi(value, musicId)
+    for (const item of apiCandidates) addCandidate(candidates, item)
+  }
+
+  const htmlCandidates = await resolveTikTokMusicFromHtml(value)
+  for (const item of htmlCandidates) addCandidate(candidates, item)
+
+  return candidates
+}
+
+function extractTikTokMusicId(value) {
+  try {
+    const parsed = new URL(value)
+    const match = parsed.pathname.match(/-(\d+)(?:\/)?$/)
+    return match?.[1] || null
+  } catch {
+    return null
+  }
+}
+
+async function resolveTikTokMusicFromApi(originalUrl, musicId) {
+  const candidates = []
+
+  const apiUrl = new URL("https://www.tiktok.com/api/music/item_list/")
+  const params = {
+    WebIdLastTime: String(Math.floor(Date.now() / 1000)),
+    aid: "1988",
+    app_language: "en",
+    app_name: "tiktok_web",
+    browser_language: "en-US",
+    browser_name: "Mozilla",
+    browser_online: "true",
+    browser_platform: "Win32",
+    browser_version: "5.0",
+    channel: "tiktok_web",
+    cookie_enabled: "true",
+    count: "6",
+    cursor: "0",
+    device_platform: "web_pc",
+    focus_state: "true",
+    from_page: "music",
+    history_len: "1",
+    is_fullscreen: "false",
+    is_page_visible: "true",
+    musicID: musicId,
+    os: "windows",
+    priority_region: "",
+    referer: "",
+    region: "US",
+    screen_height: "1080",
+    screen_width: "1920",
+    tz_name: "UTC",
+    webcast_language: "en"
+  }
+
+  for (const [key, value] of Object.entries(params)) {
+    apiUrl.searchParams.set(key, value)
+  }
+
+  try {
+    const response = await fetch(apiUrl.toString(), {
+      redirect: "follow",
+      headers: browserHeaders(originalUrl)
+    })
+
+    if (!response.ok) return candidates
+
+    const data = await response.json().catch(() => null)
+    const items = data?.itemList || data?.items || []
+
+    for (const item of items) {
+      const author = item?.author?.uniqueId || item?.authorInfo?.uniqueId
+      const id = item?.id || item?.aweme_id || item?.video?.id
+
+      if (author && id) {
+        addCandidate(candidates, `https://www.tiktok.com/@${author}/video/${id}`)
+      }
+
+      const playUrl = item?.music?.playUrl || item?.music?.play_url?.uri || item?.music?.play_url?.url_list?.[0]
+      if (playUrl) addCandidate(candidates, playUrl)
+    }
+
+    return candidates
+  } catch {
+    return candidates
+  }
+}
+
+async function resolveTikTokMusicFromHtml(value) {
+  const candidates = []
+
   try {
     const response = await fetch(value, {
       redirect: "follow",
-      headers: {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9,id;q=0.8",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-      }
+      headers: browserHeaders(value)
     })
 
-    if (!response.ok) return null
+    if (!response.ok) return candidates
 
     const html = await response.text()
     const normalizedHtml = html
       .replaceAll("\\u002F", "/")
       .replaceAll("\\/", "/")
+      .replaceAll("&amp;", "&")
 
-    const absoluteMatch = normalizedHtml.match(/https:\/\/www\.tiktok\.com\/@[^"'<>\s]+\/video\/\d+/)
-    if (absoluteMatch?.[0]) return absoluteMatch[0]
+    collectMatches(candidates, normalizedHtml, /https:\/\/www\.tiktok\.com\/@[^"'<>\s]+\/video\/\d+/g)
+    collectMatches(candidates, normalizedHtml, /\/@[^"'<>\s]+\/video\/\d+/g, "https://www.tiktok.com")
+    collectMatches(candidates, normalizedHtml, /https:\/\/[^"'<>\s]+\.tiktokcdn\.com\/[^"'<>\s]+/g)
 
-    const relativeMatch = normalizedHtml.match(/\/@[^"'<>\s]+\/video\/\d+/)
-    if (relativeMatch?.[0]) return `https://www.tiktok.com${relativeMatch[0]}`
-
-    return null
+    return candidates
   } catch {
-    return null
+    return candidates
+  }
+}
+
+async function resolveInstagramAudioCandidates(value) {
+  const candidates = []
+
+  try {
+    const response = await fetch(value, {
+      redirect: "follow",
+      headers: browserHeaders(value)
+    })
+
+    if (!response.ok) return candidates
+
+    const html = await response.text()
+    const normalizedHtml = html
+      .replaceAll("\\u002F", "/")
+      .replaceAll("\\/", "/")
+      .replaceAll("&amp;", "&")
+
+    collectMatches(candidates, normalizedHtml, /https:\/\/www\.instagram\.com\/reel\/[^"'<>\\s/]+\/?/g)
+    collectMatches(candidates, normalizedHtml, /\/reel\/[^"'<>\\s/]+\/?/g, "https://www.instagram.com")
+    collectMatches(candidates, normalizedHtml, /https:\/\/[^"'<>\\s]+\.cdninstagram\.com\/[^"'<>\\s]+/g)
+
+    return candidates
+  } catch {
+    return candidates
+  }
+}
+
+function collectMatches(candidates, text, regex, prefix = "") {
+  const matches = text.matchAll(regex)
+  for (const match of matches) {
+    const value = match?.[0]
+    if (value) addCandidate(candidates, prefix ? `${prefix}${value}` : value)
+  }
+}
+
+function browserHeaders(referer) {
+  return {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+    "accept-language": "en-US,en;q=0.9,id;q=0.8",
+    "referer": referer,
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
   }
 }
 
@@ -909,7 +1194,7 @@ function simplifyError(message) {
   }
 
   if (lower.includes("no working app info") || lower.includes("functionality for this site has been marked as broken")) {
-    return "Link musik ini belum bisa diproses langsung oleh fallback engine. Untuk TikTok Music, buka sound tersebut, pilih salah satu video yang memakai sound itu, lalu download lewat tab Audio."
+    return "Resolver musik belum menemukan sumber audio untuk link ini. Coba ulangi beberapa saat lagi atau pakai link video/post yang memakai musik tersebut."
   }
 
   if (lower.includes("unsupported url")) {
