@@ -1,66 +1,27 @@
-# MenGinaSV Worker
+# MenGinaSV Public Worker
 
-Worker downloader untuk Railway/VPS.
+Worker publik gratis untuk MenGinaSV.
 
-## ENV wajib
+## Mode kerja
+
+1. Direct media link diproses paling stabil.
+2. Link platform publik dicoba dengan yt-dlp + ffmpeg + deno.
+3. Kalau platform memblokir server, worker memberi error yang jelas.
+4. Optional external fallback API tersedia jika nanti kamu punya provider sendiri.
+
+## ENV Railway
 
 ```env
 WORKER_TOKEN=token-kamu
 PUBLIC_BASE_URL=https://domain-worker-kamu.up.railway.app
+RATE_LIMIT_PER_MINUTE=20
 ```
 
-## ENV optional untuk YouTube bot verification
-
-YouTube kadang menolak request dari IP server dan menampilkan:
-
-```text
-Sign in to confirm you’re not a bot
-Use --cookies-from-browser or --cookies
-```
-
-Worker ini support cookies lewat Railway Variables.
-
-### Cara aman pakai cookies
-
-1. Export cookies YouTube dari browser kamu ke format `cookies.txt`.
-2. Jangan upload cookies ke GitHub.
-3. Convert isi file cookies ke base64.
-4. Masukkan ke Railway Variables:
+Optional:
 
 ```env
-YOUTUBE_COOKIES_B64=hasil_base64_cookies_txt
-```
-
-Worker akan decode otomatis ke:
-
-```text
-downloads/youtube-cookies.txt
-```
-
-Lalu yt-dlp otomatis memakai:
-
-```bash
---cookies downloads/youtube-cookies.txt
-```
-
-## Cara convert cookies.txt ke base64
-
-Windows PowerShell:
-
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt")) | Set-Clipboard
-```
-
-Mac/Linux:
-
-```bash
-base64 -w 0 cookies.txt
-```
-
-Jika di Mac command `-w` error:
-
-```bash
-base64 cookies.txt | tr -d '\n'
+EXTERNAL_DOWNLOADER_API_URL=
+EXTERNAL_DOWNLOADER_API_KEY=
 ```
 
 ## Cek worker
@@ -69,12 +30,12 @@ base64 cookies.txt | tr -d '\n'
 https://domain-worker-kamu.up.railway.app/health
 ```
 
-Kalau cookies aktif, response health memuat:
+Response harus memuat:
 
 ```json
-"cookiesEnabled": true
+"mode": "public-free"
 ```
 
-## Catatan keamanan
+## Catatan
 
-Cookies adalah sesi login. Jangan commit ke GitHub. Jangan pakai akun utama untuk layanan publik. Cookies bisa kedaluwarsa, jadi perlu diganti ulang jika error muncul lagi.
+Mode ini tidak memakai cookies login pribadi. Cocok untuk publik karena lebih aman, tapi platform besar tetap bisa membatasi request server.
