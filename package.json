@@ -1,6 +1,6 @@
 {
-  "name": "menginasv-public-worker",
-  "version": "4.0.0",
+  "name": "menginasv-cobalt-ready-worker",
+  "version": "5.0.0",
   "private": true,
   "type": "module",
   "scripts": {
