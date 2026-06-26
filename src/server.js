@@ -19,7 +19,9 @@ const PHOTO_TYPES = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "avif"]
 
 const rateStore = new Map()
 
-if (!existsSync(downloadDir)) mkdirSync(downloadDir, { recursive: true })
+if (!existsSync(downloadDir)) {
+  mkdirSync(downloadDir, { recursive: true })
+}
 
 app.use(helmet({ crossOriginResourcePolicy: false }))
 app.use(cors())
@@ -30,7 +32,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "cobalt-api + direct-file + yt-dlp + ffmpeg + deno",
+    engine: "cobalt-api + picker + local-processing + direct-file + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
@@ -57,7 +59,10 @@ app.post("/api/download", async (req, res) => {
     }
 
     if (!allowRequest(getClientKey(req))) {
-      return res.status(429).json({ ok: false, error: "Terlalu banyak request. Tunggu sebentar lalu coba lagi." })
+      return res.status(429).json({
+        ok: false,
+        error: "Terlalu banyak request. Tunggu sebentar lalu coba lagi."
+      })
     }
 
     const url = normalizeUrl(req.body?.url)
@@ -65,12 +70,23 @@ app.post("/api/download", async (req, res) => {
     const quality = String(req.body?.quality || "best").toLowerCase()
     const fileType = normalizeFileType(req.body?.fileType, mediaGroup)
 
-    if (!url) return res.status(400).json({ ok: false, error: "URL tidak valid." })
+    if (!url) {
+      return res.status(400).json({ ok: false, error: "URL tidak valid." })
+    }
 
     cleanupOldFiles()
 
-    const cobaltResult = await tryCobalt({ url, mediaGroup, quality, fileType })
-    if (cobaltResult?.ok) return res.json(cobaltResult)
+    const cobaltResult = await tryCobalt({
+      req,
+      url,
+      mediaGroup,
+      quality,
+      fileType
+    })
+
+    if (cobaltResult?.ok) {
+      return res.json(cobaltResult)
+    }
 
     const directType = detectDirectMedia(url)
     const jobId = nanoid(10)
@@ -85,7 +101,7 @@ app.post("/api/download", async (req, res) => {
     if (!outputFile || !existsSync(outputFile)) {
       return res.status(422).json({
         ok: false,
-        error: "Provider belum bisa memproses link ini. Coba direct media link, provider Cobalt lain, atau link lain."
+        error: "Provider belum bisa memproses link ini. Coba tab lain, format lain, direct media link, atau ganti server Cobalt."
       })
     }
 
@@ -94,39 +110,26 @@ app.post("/api/download", async (req, res) => {
 
     return res.json({ ok: true, title, mediaGroup, quality, fileType, downloadUrl })
   } catch (error) {
-    return res.status(422).json({ ok: false, error: simplifyError(error?.message || "Download gagal.") })
+    return res.status(422).json({
+      ok: false,
+      error: simplifyError(error?.message || "Download gagal.")
+    })
   }
 })
 
-async function tryCobalt({ url, mediaGroup, quality, fileType }) {
+async function tryCobalt({ req, url, mediaGroup, quality, fileType }) {
   const baseUrl = process.env.COBALT_API_URL
-  if (!baseUrl) return null
+
+  if (!baseUrl) {
+    return null
+  }
 
   try {
-    const body = {
-      url,
-      filenameStyle: "basic",
-      disableMetadata: false,
-      alwaysProxy: true
-    }
-
-    if (mediaGroup === "audio") {
-      body.downloadMode = "audio"
-      body.audioFormat = mapCobaltAudioFormat(fileType)
-      body.audioBitrate = parseCobaltAudioBitrate(quality)
-    } else if (mediaGroup === "video") {
-      body.downloadMode = "auto"
-      body.videoQuality = parseCobaltVideoQuality(quality)
-      body.youtubeVideoContainer = mapCobaltVideoContainer(fileType)
-      body.youtubeVideoCodec = "h264"
-    } else if (mediaGroup === "photo") {
-      body.downloadMode = "auto"
-    }
-
+    const body = buildCobaltBody({ url, mediaGroup, quality, fileType })
     const response = await fetch(baseUrl.replace(/\/$/, "") + "/", {
       method: "POST",
       headers: {
-        "accept": "application/json",
+        accept: "application/json",
         "content-type": "application/json",
         ...(process.env.COBALT_API_KEY ? { authorization: `Api-Key ${process.env.COBALT_API_KEY}` } : {})
       },
@@ -135,7 +138,13 @@ async function tryCobalt({ url, mediaGroup, quality, fileType }) {
 
     const data = await response.json().catch(() => null)
 
-    if (!response.ok || !data) return null
+    if (!response.ok || !data) {
+      return null
+    }
+
+    if (data.status === "error") {
+      return null
+    }
 
     if (data.status === "redirect" || data.status === "tunnel") {
       return {
@@ -148,21 +157,249 @@ async function tryCobalt({ url, mediaGroup, quality, fileType }) {
       }
     }
 
-    if (data.status === "picker" && Array.isArray(data.picker) && data.picker[0]?.url) {
-      return {
-        ok: true,
-        title: data.picker[0].filename || `menginasv-${Date.now()}.${fileType}`,
+    if (data.status === "picker") {
+      return handleCobaltPicker({ data, mediaGroup, quality, fileType })
+    }
+
+    if (data.status === "local-processing") {
+      return await handleCobaltLocalProcessing({
+        req,
+        data,
         mediaGroup,
         quality,
-        fileType,
-        downloadUrl: data.picker[0].url
-      }
+        fileType
+      })
     }
 
     return null
   } catch {
     return null
   }
+}
+
+function buildCobaltBody({ url, mediaGroup, quality, fileType }) {
+  const body = {
+    url,
+    filenameStyle: "basic",
+    disableMetadata: false,
+    alwaysProxy: true,
+    localProcessing: "preferred"
+  }
+
+  if (mediaGroup === "audio") {
+    body.downloadMode = "audio"
+    body.audioFormat = mapCobaltAudioFormat(fileType)
+    body.audioBitrate = parseCobaltAudioBitrate(quality)
+    body.youtubeBetterAudio = true
+    body.tiktokFullAudio = true
+  } else if (mediaGroup === "video") {
+    body.downloadMode = "auto"
+    body.videoQuality = parseCobaltVideoQuality(quality)
+    body.youtubeVideoContainer = mapCobaltVideoContainer(fileType)
+    body.youtubeVideoCodec = "h264"
+    body.allowH265 = true
+    body.convertGif = true
+  } else if (mediaGroup === "photo") {
+    body.downloadMode = "auto"
+    body.convertGif = true
+  }
+
+  return body
+}
+
+function handleCobaltPicker({ data, mediaGroup, quality, fileType }) {
+  if (mediaGroup === "audio" && data.audio) {
+    return {
+      ok: true,
+      title: data.audioFilename || `menginasv-audio-${Date.now()}.mp3`,
+      mediaGroup,
+      quality,
+      fileType,
+      downloadUrl: data.audio
+    }
+  }
+
+  const items = Array.isArray(data.picker) ? data.picker : []
+  const selected = selectPickerItem(items, mediaGroup)
+
+  if (!selected?.url) {
+    return null
+  }
+
+  return {
+    ok: true,
+    title: selected.filename || `menginasv-${selected.type || mediaGroup}-${Date.now()}.${fileType}`,
+    mediaGroup,
+    quality,
+    fileType,
+    downloadUrl: selected.url,
+    thumb: selected.thumb || null
+  }
+}
+
+function selectPickerItem(items, mediaGroup) {
+  if (mediaGroup === "photo") {
+    return items.find((item) => item.type === "photo") ||
+      items.find((item) => item.type === "gif") ||
+      items[0]
+  }
+
+  if (mediaGroup === "video") {
+    return items.find((item) => item.type === "video") ||
+      items.find((item) => item.type === "gif") ||
+      items[0]
+  }
+
+  if (mediaGroup === "audio") {
+    return items.find((item) => item.type === "video") ||
+      items.find((item) => item.type === "gif") ||
+      items[0]
+  }
+
+  return items[0]
+}
+
+async function handleCobaltLocalProcessing({ req, data, mediaGroup, quality, fileType }) {
+  const tunnels = Array.isArray(data.tunnel) ? data.tunnel : []
+
+  if (!tunnels.length) {
+    return null
+  }
+
+  const jobId = nanoid(10)
+  const outputFilename = sanitizeFilename(data.output?.filename || `menginasv-${jobId}.${fileType}`)
+  const outputExt = extname(outputFilename).replace(".", "").toLowerCase()
+  const finalExt = outputExt || fileType
+  const outputFile = join(downloadDir, `${jobId}.${finalExt}`)
+
+  if (tunnels.length === 1) {
+    const sourceFile = join(downloadDir, `${jobId}-source${extname(outputFilename) || "." + fileType}`)
+    await downloadDirectFile(tunnels[0], sourceFile)
+
+    const currentExt = extname(sourceFile).replace(".", "").toLowerCase()
+
+    if (isCompatibleExt(currentExt, fileType, mediaGroup)) {
+      const publicUrl = `${getPublicBase(req)}/files/${encodeURIComponent(basename(sourceFile))}`
+      return {
+        ok: true,
+        title: basename(sourceFile),
+        mediaGroup,
+        quality,
+        fileType,
+        downloadUrl: publicUrl
+      }
+    }
+
+    const converted = await convertLocalFile({ sourceFile, targetExt: fileType, mediaGroup, quality, jobId })
+    if (!converted) return null
+
+    const publicUrl = `${getPublicBase(req)}/files/${encodeURIComponent(basename(converted))}`
+
+    return {
+      ok: true,
+      title: basename(converted),
+      mediaGroup,
+      quality,
+      fileType,
+      downloadUrl: publicUrl
+    }
+  }
+
+  const sourceFiles = []
+
+  for (let i = 0; i < tunnels.length; i++) {
+    const source = join(downloadDir, `${jobId}-part-${i}.bin`)
+    await downloadDirectFile(tunnels[i], source)
+    sourceFiles.push(source)
+  }
+
+  const target = join(downloadDir, `${jobId}.${fileType}`)
+  await mergeCobaltParts({ sourceFiles, target, mediaGroup, fileType })
+
+  for (const source of sourceFiles) {
+    safeRemove(source)
+  }
+
+  if (!existsSync(target)) return null
+
+  const publicUrl = `${getPublicBase(req)}/files/${encodeURIComponent(basename(target))}`
+
+  return {
+    ok: true,
+    title: basename(target),
+    mediaGroup,
+    quality,
+    fileType,
+    downloadUrl: publicUrl
+  }
+}
+
+async function mergeCobaltParts({ sourceFiles, target, mediaGroup, fileType }) {
+  if (mediaGroup === "audio") {
+    await mustRun("ffmpeg", [
+      "-y",
+      "-i", sourceFiles[0],
+      ...sourceFiles.slice(1).flatMap((file) => ["-i", file]),
+      ...buildAudioOutputArgs(fileType, null),
+      target
+    ], 260000)
+    return
+  }
+
+  if (sourceFiles.length >= 2) {
+    await mustRun("ffmpeg", [
+      "-y",
+      "-i", sourceFiles[0],
+      "-i", sourceFiles[1],
+      "-map", "0:v:0?",
+      "-map", "1:a:0?",
+      ...buildVideoOutputArgs(fileType),
+      target
+    ], 300000)
+    return
+  }
+
+  await mustRun("ffmpeg", [
+    "-y",
+    "-i", sourceFiles[0],
+    ...buildVideoOutputArgs(fileType),
+    target
+  ], 260000)
+}
+
+async function convertLocalFile({ sourceFile, targetExt, mediaGroup, quality, jobId }) {
+  const target = join(downloadDir, `${jobId}.${targetExt}`)
+
+  if (mediaGroup === "audio") {
+    await mustRun("ffmpeg", [
+      "-y",
+      "-i", sourceFile,
+      ...buildAudioOutputArgs(targetExt, parseAudioBitrate(quality)),
+      target
+    ], 260000)
+  } else if (mediaGroup === "photo") {
+    await mustRun("ffmpeg", ["-y", "-i", sourceFile, target], 180000)
+  } else {
+    await mustRun("ffmpeg", [
+      "-y",
+      "-i", sourceFile,
+      ...buildVideoOutputArgs(targetExt),
+      target
+    ], 260000)
+  }
+
+  safeRemove(sourceFile)
+  return existsSync(target) ? target : null
+}
+
+function isCompatibleExt(currentExt, targetExt, mediaGroup) {
+  if (!currentExt || !targetExt) return false
+  if (currentExt === targetExt) return true
+  if (targetExt === "jpeg" && currentExt === "jpg") return true
+
+  if (mediaGroup === "video" && targetExt === "mp4" && ["mp4", "m4v"].includes(currentExt)) return true
+  if (mediaGroup === "audio" && targetExt === "mp3" && currentExt === "mp3") return true
+  return false
 }
 
 function mapCobaltAudioFormat(fileType) {
@@ -198,6 +435,7 @@ async function processDirectMedia({ url, jobId, mediaGroup, fileType }) {
   if (mediaGroup === "video") {
     const currentExt = extname(sourceFile).replace(".", "").toLowerCase()
     if (currentExt === fileType) return sourceFile
+
     const target = join(downloadDir, `${jobId}.${fileType}`)
     await mustRun("ffmpeg", buildVideoConvertArgs(sourceFile, target, fileType), 240000)
     safeRemove(sourceFile)
@@ -207,6 +445,7 @@ async function processDirectMedia({ url, jobId, mediaGroup, fileType }) {
   if (mediaGroup === "audio") {
     const currentExt = extname(sourceFile).replace(".", "").toLowerCase()
     if (currentExt === fileType) return sourceFile
+
     const target = join(downloadDir, `${jobId}.${fileType}`)
     await mustRun("ffmpeg", buildAudioConvertArgs(sourceFile, target, fileType, null), 240000)
     safeRemove(sourceFile)
@@ -216,6 +455,7 @@ async function processDirectMedia({ url, jobId, mediaGroup, fileType }) {
   if (mediaGroup === "photo") {
     const currentExt = extname(sourceFile).replace(".", "").toLowerCase()
     if (currentExt === fileType || (fileType === "jpeg" && currentExt === "jpg")) return sourceFile
+
     const target = join(downloadDir, `${jobId}.${fileType}`)
     await mustRun("ffmpeg", ["-y", "-i", sourceFile, target], 180000)
     safeRemove(sourceFile)
@@ -235,7 +475,9 @@ async function processWithYtDlp({ url, jobId, mediaGroup, quality, fileType }) {
 async function processVideo({ url, jobId, quality, fileType }) {
   const sourceTemplate = join(downloadDir, `${jobId}-source.%(ext)s`)
   const maxHeight = parseVideoHeight(quality)
-  const selector = maxHeight ? `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]/best` : "bestvideo+bestaudio/best"
+  const selector = maxHeight
+    ? `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]/best`
+    : "bestvideo+bestaudio/best"
 
   await mustRun("yt-dlp", [
     ...ytDlpBaseArgs(sourceTemplate),
@@ -246,6 +488,7 @@ async function processVideo({ url, jobId, quality, fileType }) {
 
   const source = findFile(`${jobId}-source`)
   if (!source) return null
+
   const currentExt = extname(source).replace(".", "").toLowerCase()
   if (currentExt === fileType) return source
 
@@ -268,6 +511,7 @@ async function processAudio({ url, jobId, quality, fileType }) {
 
   const source = findFile(`${jobId}-audio`)
   if (!source) return null
+
   const currentExt = extname(source).replace(".", "").toLowerCase()
   if (currentExt === fileType && quality === "best") return source
 
@@ -291,6 +535,7 @@ async function processPhoto({ url, jobId, fileType }) {
 
   const source = findFile(`${jobId}-photo`)
   if (!source) return null
+
   const currentExt = extname(source).replace(".", "").toLowerCase()
   if (currentExt === fileType || (fileType === "jpeg" && currentExt === "jpg")) return source
 
@@ -318,25 +563,42 @@ function ytDlpBaseArgs(outputTemplate) {
 }
 
 function buildVideoConvertArgs(source, target, fileType) {
-  const args = ["-y", "-i", source]
-  if (fileType === "webm") args.push("-c:v", "libvpx-vp9", "-c:a", "libopus")
-  else if (fileType === "flv") args.push("-c:v", "flv", "-c:a", "mp3")
-  else if (fileType === "3gp") args.push("-s", "352x288", "-c:v", "h263", "-c:a", "aac")
-  else args.push("-c:v", "libx264", "-c:a", "aac")
-  args.push(target)
-  return args
+  return [
+    "-y",
+    "-i", source,
+    ...buildVideoOutputArgs(fileType),
+    target
+  ]
+}
+
+function buildVideoOutputArgs(fileType) {
+  if (fileType === "webm") return ["-c:v", "libvpx-vp9", "-c:a", "libopus"]
+  if (fileType === "flv") return ["-c:v", "flv", "-c:a", "mp3"]
+  if (fileType === "3gp") return ["-s", "352x288", "-c:v", "h263", "-c:a", "aac"]
+  return ["-c:v", "libx264", "-c:a", "aac"]
 }
 
 function buildAudioConvertArgs(source, target, fileType, bitrate) {
-  const args = ["-y", "-i", source]
+  return [
+    "-y",
+    "-i", source,
+    ...buildAudioOutputArgs(fileType, bitrate),
+    target
+  ]
+}
+
+function buildAudioOutputArgs(fileType, bitrate) {
+  const args = []
+
   if (fileType === "mp3") args.push("-codec:a", "libmp3lame")
   if (fileType === "m4a" || fileType === "aac") args.push("-codec:a", "aac")
   if (fileType === "wav") args.push("-codec:a", "pcm_s16le")
   if (fileType === "flac") args.push("-codec:a", "flac")
   if (fileType === "ogg") args.push("-codec:a", "libvorbis")
   if (fileType === "opus" || fileType === "webm") args.push("-codec:a", "libopus")
+
   if (bitrate && fileType !== "wav" && fileType !== "flac") args.push("-b:a", bitrate)
-  args.push(target)
+
   return args
 }
 
@@ -347,15 +609,31 @@ function preferredYtDlpAudioFormat(fileType) {
 }
 
 async function downloadDirectFile(url, target) {
-  const response = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 Chrome/120 Safari/537.36" } })
-  if (!response.ok || !response.body) throw new Error("Direct file tidak bisa diambil.")
+  const response = await fetch(url, {
+    headers: {
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+    }
+  })
+
+  if (!response.ok || !response.body) {
+    throw new Error("Direct file tidak bisa diambil.")
+  }
 
   await new Promise((resolve, reject) => {
     const fileStream = createWriteStream(target)
+
     response.body.pipeTo(new WritableStream({
-      write(chunk) { fileStream.write(Buffer.from(chunk)) },
-      close() { fileStream.end(); resolve() },
-      abort(error) { fileStream.destroy(); reject(error) }
+      write(chunk) {
+        fileStream.write(Buffer.from(chunk))
+      },
+      close() {
+        fileStream.end()
+        resolve()
+      },
+      abort(error) {
+        fileStream.destroy()
+        reject(error)
+      }
     })).catch(reject)
   })
 }
@@ -363,6 +641,7 @@ async function downloadDirectFile(url, target) {
 function mustRun(command, args, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: downloadDir, env: process.env })
+
     let stdout = ""
     let stderr = ""
     let done = false
@@ -374,13 +653,14 @@ function mustRun(command, args, timeoutMs) {
       reject(new Error("Process timeout."))
     }, timeoutMs)
 
-    child.stdout.on("data", chunk => stdout += chunk.toString())
-    child.stderr.on("data", chunk => stderr += chunk.toString())
+    child.stdout.on("data", chunk => { stdout += chunk.toString() })
+    child.stderr.on("data", chunk => { stderr += chunk.toString() })
 
     child.on("close", code => {
       if (done) return
       done = true
       clearTimeout(timer)
+
       if (code === 0) resolve({ stdout, stderr })
       else reject(new Error(stderr || stdout || `Command failed: ${command}`))
     })
@@ -396,6 +676,7 @@ function mustRun(command, args, timeoutMs) {
 
 function normalizeUrl(value) {
   const raw = String(value || "").trim()
+
   try {
     const parsed = new URL(raw)
     if (!["http:", "https:"].includes(parsed.protocol)) return null
@@ -408,7 +689,14 @@ function normalizeUrl(value) {
 
 function isPrivateHost(hostname) {
   const host = hostname.toLowerCase()
-  return host === "localhost" || host === "127.0.0.1" || host.startsWith("10.") || host.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host.startsWith("10.") ||
+    host.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+  )
 }
 
 function normalizeMediaGroup(value) {
@@ -424,9 +712,11 @@ function normalizeFileType(value, mediaGroup) {
 
 function detectDirectMedia(value) {
   const clean = value.split("?")[0].toLowerCase()
+
   if (clean.match(/\.(mp4|webm|mkv|mov|avi|m4v|3gp|flv)$/)) return "video"
   if (clean.match(/\.(mp3|m4a|wav|aac|flac|ogg|opus)$/)) return "audio"
   if (clean.match(/\.(jpg|jpeg|png|webp|gif|bmp|tiff|avif)$/)) return "photo"
+
   return null
 }
 
@@ -458,17 +748,25 @@ function getPublicBase(req) {
 function cleanupOldFiles() {
   const now = Date.now()
   const maxAge = 1000 * 60 * 30
+
   for (const file of readdirSync(downloadDir)) {
     const filePath = join(downloadDir, file)
+
     try {
       const stats = statSync(filePath)
       if (stats.isFile() && now - stats.mtimeMs > maxAge) rmSync(filePath, { force: true })
-    } catch {}
+    } catch {
+      // ignore
+    }
   }
 }
 
 function safeRemove(filePath) {
-  try { rmSync(filePath, { force: true }) } catch {}
+  try {
+    rmSync(filePath, { force: true })
+  } catch {
+    // ignore
+  }
 }
 
 function allowRequest(key) {
@@ -477,10 +775,12 @@ function allowRequest(key) {
   const windowMs = 60000
   const current = rateStore.get(key) || []
   const fresh = current.filter(timestamp => now - timestamp < windowMs)
+
   if (fresh.length >= limit) {
     rateStore.set(key, fresh)
     return false
   }
+
   fresh.push(now)
   rateStore.set(key, fresh)
   return true
@@ -490,18 +790,43 @@ function getClientKey(req) {
   return String(req.headers["x-forwarded-for"] || req.ip || "unknown").split(",")[0].trim()
 }
 
+function sanitizeFilename(value) {
+  return String(value || "menginasv-file")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .slice(0, 160)
+}
+
 function simplifyError(message) {
   const text = String(message || "").replace(/\s+/g, " ").trim()
   const lower = text.toLowerCase()
-  if (text.includes("HTTP Error 429") || lower.includes("too many requests")) return "Platform membatasi request dari IP worker/provider. Coba lagi nanti atau ganti provider Cobalt."
-  if (lower.includes("sign in to confirm") || lower.includes("not a bot")) return "Platform meminta verifikasi bot untuk link ini. Gunakan Cobalt instance yang stabil atau coba link lain."
-  if (lower.includes("unsupported url")) return "Platform atau link belum didukung engine."
-  if (lower.includes("private") || lower.includes("login")) return "Konten private atau butuh login tidak bisa diproses."
-  if (lower.includes("drm")) return "Konten DRM atau konten terbatas tidak bisa diproses."
-  if (text.includes("Process timeout")) return "Proses terlalu lama. Coba quality lebih rendah."
+
+  if (text.includes("HTTP Error 429") || lower.includes("too many requests")) {
+    return "Platform membatasi request dari IP worker/provider. Coba lagi nanti atau ganti provider Cobalt."
+  }
+
+  if (lower.includes("sign in to confirm") || lower.includes("not a bot")) {
+    return "Platform meminta verifikasi bot untuk link ini. Coba pakai Cobalt di server lain atau coba link lain."
+  }
+
+  if (lower.includes("unsupported url")) {
+    return "Platform atau link belum didukung engine."
+  }
+
+  if (lower.includes("private") || lower.includes("login")) {
+    return "Konten private atau butuh login tidak bisa diproses."
+  }
+
+  if (lower.includes("drm")) {
+    return "Konten DRM atau konten terbatas tidak bisa diproses."
+  }
+
+  if (text.includes("Process timeout")) {
+    return "Proses terlalu lama. Coba quality lebih rendah."
+  }
+
   return text.slice(0, 260) || "Download gagal."
 }
 
 app.listen(PORT, () => {
-  console.log(`MenGinaSV Cobalt-ready worker running on port ${PORT}`)
+  console.log(`MenGinaSV multi-platform worker running on port ${PORT}`)
 })
