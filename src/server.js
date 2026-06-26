@@ -32,7 +32,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "universal music resolver + type-aware cobalt + picker + local-processing + direct-file + yt-dlp + ffmpeg + deno",
+    engine: "audio-verified universal music resolver + type-aware cobalt + picker + local-processing + direct-file + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
@@ -128,7 +128,7 @@ app.post("/api/download", async (req, res) => {
     if (!outputFile || !existsSync(outputFile)) {
       return res.status(422).json({
         ok: false,
-        error: "Provider belum bisa memproses link ini. Coba tab lain, format lain, direct media link, atau ganti server Cobalt."
+        error: mediaGroup === "audio" ? "Audio tidak ditemukan atau file hasilnya kosong. Coba format MP3 128k/192k, atau gunakan link video/post yang memakai musik tersebut." : "Provider belum bisa memproses link ini. Coba tab lain, format lain, direct media link, atau ganti server Cobalt."
       })
     }
 
@@ -185,7 +185,7 @@ async function tryCobalt({ req, url, mediaGroup, quality, fileType }) {
     }
 
     if (data.status === "picker") {
-      return handleCobaltPicker({ data, mediaGroup, quality, fileType })
+      return await handleCobaltPicker({ req, data, mediaGroup, quality, fileType })
     }
 
     if (data.status === "local-processing") {
@@ -234,11 +234,11 @@ function buildCobaltBody({ url, mediaGroup, quality, fileType }) {
   return body
 }
 
-function handleCobaltPicker({ data, mediaGroup, quality, fileType }) {
+async function handleCobaltPicker({ req, data, mediaGroup, quality, fileType }) {
   if (mediaGroup === "audio" && data.audio) {
     return {
       ok: true,
-      title: data.audioFilename || `menginasv-audio-${Date.now()}.mp3`,
+      title: data.audioFilename || `audio-${Date.now()}.${fileType}`,
       mediaGroup,
       quality,
       fileType,
@@ -253,9 +253,19 @@ function handleCobaltPicker({ data, mediaGroup, quality, fileType }) {
     return null
   }
 
+  if (mediaGroup === "audio") {
+    return await processRemoteUrlAsAudio({
+      req,
+      sourceUrl: selected.url,
+      quality,
+      fileType,
+      titlePrefix: "picker-audio"
+    })
+  }
+
   return {
     ok: true,
-    title: selected.filename || `menginasv-${selected.type || mediaGroup}-${Date.now()}.${fileType}`,
+    title: selected.filename || `${selected.type || mediaGroup}-${Date.now()}.${fileType}`,
     mediaGroup,
     quality,
     fileType,
@@ -452,6 +462,110 @@ function mapCobaltVideoContainer(fileType) {
   return "auto"
 }
 
+async function processRemoteUrlAsAudio({ req, sourceUrl, quality, fileType, titlePrefix = "audio" }) {
+  const jobId = nanoid(10)
+  const sourceFile = join(downloadDir, `${jobId}-remote-source.bin`)
+
+  try {
+    await downloadDirectFile(sourceUrl, sourceFile)
+
+    if (!(await hasUsableAudioTrack(sourceFile))) {
+      safeRemove(sourceFile)
+      return null
+    }
+
+    const target = join(downloadDir, `${jobId}.${fileType}`)
+    await mustRun("ffmpeg", buildAudioConvertArgs(sourceFile, target, fileType, parseAudioBitrate(quality)), 260000)
+    safeRemove(sourceFile)
+
+    if (!(await hasUsableAudioTrack(target))) {
+      safeRemove(target)
+      return null
+    }
+
+    const publicUrl = `${getPublicBase(req)}/files/${encodeURIComponent(basename(target))}`
+
+    return {
+      ok: true,
+      title: `${titlePrefix}-${Date.now()}.${fileType}`,
+      mediaGroup: "audio",
+      quality,
+      fileType,
+      downloadUrl: publicUrl
+    }
+  } catch {
+    safeRemove(sourceFile)
+    return null
+  }
+}
+
+async function hasUsableAudioTrack(filePath) {
+  if (!existsSync(filePath)) return false
+
+  try {
+    const stats = statSync(filePath)
+    if (!stats.isFile() || stats.size < 2048) return false
+  } catch {
+    return false
+  }
+
+  try {
+    const result = await runForOutput("ffprobe", [
+      "-v", "error",
+      "-select_streams", "a:0",
+      "-show_entries", "stream=codec_type",
+      "-show_entries", "format=duration",
+      "-of", "json",
+      filePath
+    ], 60000)
+
+    const parsed = JSON.parse(result.stdout || "{}")
+    const hasAudio = Array.isArray(parsed.streams) && parsed.streams.some((stream) => stream.codec_type === "audio")
+    const duration = Number(parsed.format?.duration || 0)
+
+    return hasAudio && duration > 0.2
+  } catch {
+    return false
+  }
+}
+
+function runForOutput(command, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: downloadDir, env: process.env })
+
+    let stdout = ""
+    let stderr = ""
+    let done = false
+
+    const timer = setTimeout(() => {
+      if (done) return
+      done = true
+      child.kill("SIGKILL")
+      reject(new Error("Process timeout."))
+    }, timeoutMs)
+
+    child.stdout.on("data", chunk => { stdout += chunk.toString() })
+    child.stderr.on("data", chunk => { stderr += chunk.toString() })
+
+    child.on("close", code => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+
+      if (code === 0) resolve({ stdout, stderr })
+      else reject(new Error(stderr || stdout || `Command failed: ${command}`))
+    })
+
+    child.on("error", error => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+}
+
+
 async function processDirectMedia({ url, jobId, mediaGroup, fileType }) {
   const parsed = new URL(url)
   const sourceExt = extname(parsed.pathname).replace(".", "").toLowerCase() || fileType
@@ -471,11 +585,17 @@ async function processDirectMedia({ url, jobId, mediaGroup, fileType }) {
 
   if (mediaGroup === "audio") {
     const currentExt = extname(sourceFile).replace(".", "").toLowerCase()
-    if (currentExt === fileType) return sourceFile
+    if (currentExt === fileType && await hasUsableAudioTrack(sourceFile)) return sourceFile
 
     const target = join(downloadDir, `${jobId}.${fileType}`)
     await mustRun("ffmpeg", buildAudioConvertArgs(sourceFile, target, fileType, null), 240000)
     safeRemove(sourceFile)
+
+    if (!existsSync(target) || !(await hasUsableAudioTrack(target))) {
+      safeRemove(target)
+      return null
+    }
+
     return target
   }
 
@@ -540,13 +660,19 @@ async function processAudio({ url, jobId, quality, fileType }) {
   if (!source) return null
 
   const currentExt = extname(source).replace(".", "").toLowerCase()
-  if (currentExt === fileType && quality === "best") return source
+  if (currentExt === fileType && quality === "best" && await hasUsableAudioTrack(source)) return source
 
   const target = join(downloadDir, `${jobId}.${fileType}`)
   const bitrate = parseAudioBitrate(quality)
   await mustRun("ffmpeg", buildAudioConvertArgs(source, target, fileType, bitrate), 260000)
   safeRemove(source)
-  return existsSync(target) ? target : null
+
+  if (!existsSync(target) || !(await hasUsableAudioTrack(target))) {
+    safeRemove(target)
+    return null
+  }
+
+  return target
 }
 
 async function processPhoto({ url, jobId, fileType }) {
@@ -798,6 +924,35 @@ async function processMusicPage({ req, originalUrl, quality, fileType, jobId }) 
   for (const candidateUrl of candidateUrls) {
     const directType = detectDirectMedia(candidateUrl)
 
+    try {
+      if (directType) {
+        const outputFile = await processDirectMedia({
+          url: candidateUrl,
+          jobId: `${jobId}-music`,
+          mediaGroup: "audio",
+          fileType
+        })
+
+        if (outputFile && await hasUsableAudioTrack(outputFile)) return { outputFile }
+        if (outputFile) safeRemove(outputFile)
+      }
+
+      if (!isNonDownloadableMusicPage(candidateUrl)) {
+        const outputFile = await processWithYtDlp({
+          url: candidateUrl,
+          jobId: `${jobId}-music`,
+          mediaGroup: "audio",
+          quality,
+          fileType
+        })
+
+        if (outputFile && await hasUsableAudioTrack(outputFile)) return { outputFile }
+        if (outputFile) safeRemove(outputFile)
+      }
+    } catch {
+      // Try Cobalt below.
+    }
+
     const cobaltResult = await tryCobalt({
       req,
       url: candidateUrl,
@@ -813,33 +968,6 @@ async function processMusicPage({ req, originalUrl, quality, fileType, jobId }) 
         mediaGroup: "audio",
         fileType
       }
-    }
-
-    try {
-      if (directType) {
-        const outputFile = await processDirectMedia({
-          url: candidateUrl,
-          jobId: `${jobId}-music`,
-          mediaGroup: "audio",
-          fileType
-        })
-
-        if (outputFile) return { outputFile }
-      }
-
-      if (!isNonDownloadableMusicPage(candidateUrl)) {
-        const outputFile = await processWithYtDlp({
-          url: candidateUrl,
-          jobId: `${jobId}-music`,
-          mediaGroup: "audio",
-          quality,
-          fileType
-        })
-
-        if (outputFile) return { outputFile }
-      }
-    } catch {
-      // Try next candidate.
     }
   }
 
