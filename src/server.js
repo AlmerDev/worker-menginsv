@@ -32,7 +32,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "verified music-page resolver + audio-only guard + cobalt + picker + local-processing + yt-dlp + ffmpeg + deno",
+    engine: "convert-warning guard + verified audio + cobalt + picker + local-processing + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
@@ -72,6 +72,16 @@ app.post("/api/download", async (req, res) => {
 
     if (!url) {
       return res.status(400).json({ ok: false, error: "URL tidak valid." })
+    }
+
+    const downloadBlockReason = getDownloadBlockReason(url)
+
+    if (downloadBlockReason) {
+      return res.status(422).json({
+        ok: false,
+        blocked: true,
+        error: downloadBlockReason
+      })
     }
 
     cleanupOldFiles()
@@ -1229,6 +1239,47 @@ function browserHeaders(referer) {
     "accept-language": "en-US,en;q=0.9,id;q=0.8",
     "referer": referer,
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+  }
+}
+
+function getDownloadBlockReason(value) {
+  if (isTikTokMusicUrl(value)) {
+    return "Link TikTok Music/Sound belum bisa diunduh langsung. Buka sound tersebut, pilih salah satu video yang memakai sound itu, lalu paste link videonya dan pilih tab Audio."
+  }
+
+  if (isInstagramAudioUrl(value)) {
+    return "Link halaman audio Instagram belum bisa diunduh langsung. Pakai link Reel/Post yang memakai audio tersebut, lalu pilih tab Audio."
+  }
+
+  if (isSpotifyUrl(value)) {
+    return "Spotify tidak didukung untuk download langsung karena butuh login/DRM. Gunakan link audio publik lain atau direct MP3."
+  }
+
+  if (isAppleMusicUrl(value)) {
+    return "Apple Music tidak didukung untuk download langsung karena butuh login/DRM. Gunakan link audio publik lain atau direct MP3."
+  }
+
+  if (isYouTubeMusicUrl(value) && !getYouTubeVideoId(value)) {
+    return "Link YouTube Music ini tidak punya video ID yang bisa diproses. Pakai link lagu yang ada parameter v= atau link YouTube video biasa."
+  }
+
+  return null
+}
+
+function getYouTubeVideoId(value) {
+  try {
+    const parsed = new URL(value)
+    if (parsed.hostname.includes("youtu.be")) return parsed.pathname.replace("/", "").split("?")[0] || null
+    if (parsed.hostname.includes("youtube.com")) {
+      if (parsed.searchParams.get("v")) return parsed.searchParams.get("v")
+      const shortsMatch = parsed.pathname.match(/\/shorts\/([^/?]+)/)
+      if (shortsMatch) return shortsMatch[1]
+      const embedMatch = parsed.pathname.match(/\/embed\/([^/?]+)/)
+      if (embedMatch) return embedMatch[1]
+    }
+    return null
+  } catch {
+    return null
   }
 }
 
