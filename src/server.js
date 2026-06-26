@@ -32,7 +32,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "audio-verified universal music resolver + type-aware cobalt + picker + local-processing + direct-file + yt-dlp + ffmpeg + deno",
+    engine: "verified music-page resolver + audio-only guard + cobalt + picker + local-processing + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
@@ -76,19 +76,9 @@ app.post("/api/download", async (req, res) => {
 
     cleanupOldFiles()
 
-    const cobaltResult = await tryCobalt({
-      req,
-      url,
-      mediaGroup,
-      quality,
-      fileType
-    })
+    const audioOnlyPage = isAudioOnlyPageUrl(url)
 
-    if (cobaltResult?.ok) {
-      return res.json(cobaltResult)
-    }
-
-    if (isAudioOnlyPageUrl(url) && mediaGroup !== "audio") {
+    if (audioOnlyPage && mediaGroup !== "audio") {
       return res.status(422).json({
         ok: false,
         error: "Link ini terdeteksi sebagai musik/audio. Pilih tab Audio saja."
@@ -99,7 +89,7 @@ app.post("/api/download", async (req, res) => {
     const jobId = nanoid(10)
     let outputFile = null
 
-    if (!directType && isAudioOnlyPageUrl(url)) {
+    if (audioOnlyPage && !directType) {
       const musicResult = await processMusicPage({
         req,
         originalUrl: url,
@@ -115,6 +105,27 @@ app.post("/api/download", async (req, res) => {
       if (musicResult?.outputFile) {
         outputFile = musicResult.outputFile
       }
+
+      if (!outputFile) {
+        return res.status(422).json({
+          ok: false,
+          error: "Resolver musik belum menemukan audio yang valid untuk link ini. Untuk TikTok Music, pakai link video yang memakai sound tersebut kalau sound page tetap gagal."
+        })
+      }
+    }
+
+    if (!audioOnlyPage) {
+      const cobaltResult = await tryCobalt({
+        req,
+        url,
+        mediaGroup,
+        quality,
+        fileType
+      })
+
+      if (cobaltResult?.ok) {
+        return res.json(cobaltResult)
+      }
     }
 
     if (!outputFile) {
@@ -128,7 +139,7 @@ app.post("/api/download", async (req, res) => {
     if (!outputFile || !existsSync(outputFile)) {
       return res.status(422).json({
         ok: false,
-        error: mediaGroup === "audio" ? "Audio tidak ditemukan atau file hasilnya kosong. Coba format MP3 128k/192k, atau gunakan link video/post yang memakai musik tersebut." : "Provider belum bisa memproses link ini. Coba tab lain, format lain, direct media link, atau ganti server Cobalt."
+        error: mediaGroup === "audio" ? "Audio valid tidak ditemukan. Worker sudah menolak file kosong. Coba link video/post yang memakai sound tersebut." : "Provider belum bisa memproses link ini. Coba tab lain, format lain, direct media link, atau ganti server Cobalt."
       })
     }
 
@@ -961,13 +972,16 @@ async function processMusicPage({ req, originalUrl, quality, fileType, jobId }) 
       fileType
     })
 
-    if (cobaltResult?.ok) {
-      return {
-        ...cobaltResult,
-        title: cobaltResult.title || `music-${Date.now()}.${fileType}`,
-        mediaGroup: "audio",
-        fileType
-      }
+    if (cobaltResult?.ok && cobaltResult.downloadUrl) {
+      const verified = await processRemoteUrlAsAudio({
+        req,
+        sourceUrl: cobaltResult.downloadUrl,
+        quality,
+        fileType,
+        titlePrefix: "music-cobalt"
+      })
+
+      if (verified?.ok) return verified
     }
   }
 
@@ -996,7 +1010,9 @@ async function resolveMusicCandidates(value) {
   const candidates = []
   const normalized = normalizeMusicUrl(value)
 
-  addCandidate(candidates, normalized)
+  if (isYouTubeMusicUrl(value) || isSoundCloudUrl(value)) {
+    addCandidate(candidates, normalized)
+  }
 
   const externalCandidates = await resolveWithExternalMusicApi(normalized)
   for (const item of externalCandidates) addCandidate(candidates, item)
@@ -1009,6 +1025,10 @@ async function resolveMusicCandidates(value) {
   if (isInstagramAudioUrl(normalized)) {
     const instagramCandidates = await resolveInstagramAudioCandidates(normalized)
     for (const item of instagramCandidates) addCandidate(candidates, item)
+  }
+
+  if (!isTikTokMusicUrl(value) && !isInstagramAudioUrl(value) && !isSpotifyUrl(value) && !isAppleMusicUrl(value)) {
+    addCandidate(candidates, normalized)
   }
 
   return candidates
