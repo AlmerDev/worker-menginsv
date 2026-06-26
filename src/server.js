@@ -32,7 +32,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "cobalt-api + picker + local-processing + direct-file + yt-dlp + ffmpeg + deno",
+    engine: "type-aware cobalt + music/audio routing + picker + local-processing + direct-file + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
@@ -88,14 +88,53 @@ app.post("/api/download", async (req, res) => {
       return res.json(cobaltResult)
     }
 
+    if (isAudioOnlyPageUrl(url) && mediaGroup !== "audio") {
+      return res.status(422).json({
+        ok: false,
+        error: "Link ini terdeteksi sebagai musik/audio. Pilih tab Audio saja."
+      })
+    }
+
     const directType = detectDirectMedia(url)
     const jobId = nanoid(10)
     let outputFile = null
 
-    if (directType) {
-      outputFile = await processDirectMedia({ url, jobId, mediaGroup, fileType })
-    } else {
-      outputFile = await processWithYtDlp({ url, jobId, mediaGroup, quality, fileType })
+    if (!directType && isTikTokMusicUrl(url)) {
+      const resolvedVideoUrl = await resolveTikTokMusicToVideoUrl(url)
+
+      if (resolvedVideoUrl) {
+        const resolvedCobalt = await tryCobalt({
+          req,
+          url: resolvedVideoUrl,
+          mediaGroup: "audio",
+          quality,
+          fileType
+        })
+
+        if (resolvedCobalt?.ok) {
+          return res.json({
+            ...resolvedCobalt,
+            title: resolvedCobalt.title || `tiktok-music-${Date.now()}.${fileType}`,
+            mediaGroup: "audio"
+          })
+        }
+
+        outputFile = await processWithYtDlp({
+          url: resolvedVideoUrl,
+          jobId,
+          mediaGroup: "audio",
+          quality,
+          fileType
+        })
+      }
+    }
+
+    if (!outputFile) {
+      if (directType) {
+        outputFile = await processDirectMedia({ url, jobId, mediaGroup, fileType })
+      } else {
+        outputFile = await processWithYtDlp({ url, jobId, mediaGroup, quality, fileType })
+      }
     }
 
     if (!outputFile || !existsSync(outputFile)) {
@@ -699,6 +738,69 @@ function isPrivateHost(hostname) {
   )
 }
 
+function isAudioOnlyPageUrl(value) {
+  return isTikTokMusicUrl(value) || isYouTubeMusicUrl(value) || isSoundCloudUrl(value)
+}
+
+function isTikTokMusicUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.hostname.includes("tiktok.com") && parsed.pathname.includes("/music/")
+  } catch {
+    return false
+  }
+}
+
+function isYouTubeMusicUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.hostname.includes("music.youtube.com")
+  } catch {
+    return false
+  }
+}
+
+function isSoundCloudUrl(value) {
+  try {
+    const parsed = new URL(value)
+    return parsed.hostname.includes("soundcloud.com")
+  } catch {
+    return false
+  }
+}
+
+async function resolveTikTokMusicToVideoUrl(value) {
+  try {
+    const response = await fetch(value, {
+      redirect: "follow",
+      headers: {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9,id;q=0.8",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+      }
+    })
+
+    if (!response.ok) return null
+
+    const html = await response.text()
+
+    const absoluteMatch = html.match(/https:\/\/www\.tiktok\.com\/@[^"'<>\\\s]+\/video\/\d+/)
+    if (absoluteMatch?.[0]) return absoluteMatch[0].replace(/\\u002F/g, "/")
+
+    const escapedMatch = html.match(/https:\\/\\/www\.tiktok\.com\\/(@[^"'<>\\\s]+)\\/video\\/(\d+)/)
+    if (escapedMatch?.[1] && escapedMatch?.[2]) {
+      return `https://www.tiktok.com/${escapedMatch[1]}/video/${escapedMatch[2]}`
+    }
+
+    const relativeMatch = html.match(/\/@[^"'<>\\\s]+\/video\/\d+/)
+    if (relativeMatch?.[0]) return `https://www.tiktok.com${relativeMatch[0]}`
+
+    return null
+  } catch {
+    return null
+  }
+}
+
 function normalizeMediaGroup(value) {
   const mediaGroup = String(value || "video").toLowerCase()
   return ["video", "audio", "photo"].includes(mediaGroup) ? mediaGroup : "video"
@@ -808,6 +910,10 @@ function simplifyError(message) {
     return "Platform meminta verifikasi bot untuk link ini. Coba pakai Cobalt di server lain atau coba link lain."
   }
 
+  if (lower.includes("no working app info") || lower.includes("functionality for this site has been marked as broken")) {
+    return "Link musik ini belum bisa diproses langsung oleh fallback engine. Untuk TikTok Music, buka sound tersebut, pilih salah satu video yang memakai sound itu, lalu download lewat tab Audio."
+  }
+
   if (lower.includes("unsupported url")) {
     return "Platform atau link belum didukung engine."
   }
@@ -828,5 +934,5 @@ function simplifyError(message) {
 }
 
 app.listen(PORT, () => {
-  console.log(`MenGinaSV multi-platform worker running on port ${PORT}`)
+  console.log(`MgreSV type-aware music worker running on port ${PORT}`)
 })
