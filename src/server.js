@@ -783,16 +783,14 @@ async function resolveTikTokMusicToVideoUrl(value) {
     if (!response.ok) return null
 
     const html = await response.text()
+    const normalizedHtml = html
+      .replaceAll("\\u002F", "/")
+      .replaceAll("\\/", "/")
 
-    const absoluteMatch = html.match(/https:\/\/www\.tiktok\.com\/@[^"'<>\\\s]+\/video\/\d+/)
-    if (absoluteMatch?.[0]) return absoluteMatch[0].replace(/\\u002F/g, "/")
+    const absoluteMatch = normalizedHtml.match(/https:\/\/www\.tiktok\.com\/@[^"'<>\s]+\/video\/\d+/)
+    if (absoluteMatch?.[0]) return absoluteMatch[0]
 
-    const escapedMatch = html.match(/https:\\/\\/www\.tiktok\.com\\/(@[^"'<>\\\s]+)\\/video\\/(\d+)/)
-    if (escapedMatch?.[1] && escapedMatch?.[2]) {
-      return `https://www.tiktok.com/${escapedMatch[1]}/video/${escapedMatch[2]}`
-    }
-
-    const relativeMatch = html.match(/\/@[^"'<>\\\s]+\/video\/\d+/)
+    const relativeMatch = normalizedHtml.match(/\/@[^"'<>\s]+\/video\/\d+/)
     if (relativeMatch?.[0]) return `https://www.tiktok.com${relativeMatch[0]}`
 
     return null
