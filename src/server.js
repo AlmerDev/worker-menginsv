@@ -2,6 +2,7 @@ import express from "express"
 import cors from "cors"
 import helmet from "helmet"
 import { nanoid } from "nanoid"
+import archiver from "archiver"
 import { spawn } from "node:child_process"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs"
 import { basename, extname, join } from "node:path"
@@ -32,7 +33,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "convert-warning guard + verified audio + cobalt + picker + local-processing + yt-dlp + ffmpeg + deno",
+    engine: "carousel slides + per-slide download + zip all slides + cobalt + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
@@ -48,6 +49,213 @@ app.use("/files", express.static(downloadDir, {
     res.setHeader("cross-origin-resource-policy", "cross-origin")
   }
 }))
+
+
+app.post("/api/inspect", async (req, res) => {
+  try {
+    const auth = req.headers.authorization || ""
+    const requiredToken = process.env.WORKER_TOKEN || ""
+
+    if (requiredToken && auth !== `Bearer ${requiredToken}`) {
+      return res.status(401).json({ ok: false, error: "Unauthorized worker token." })
+    }
+
+    const url = normalizeUrl(req.body?.url)
+
+    if (!url) {
+      return res.status(400).json({ ok: false, error: "URL tidak valid." })
+    }
+
+    const cobaltInspect = await inspectWithCobalt(url)
+
+    if (cobaltInspect?.ok) {
+      return res.json(cobaltInspect)
+    }
+
+    const ytdlpInspect = await inspectWithYtDlp(url)
+
+    if (ytdlpInspect?.ok) {
+      return res.json(ytdlpInspect)
+    }
+
+    return res.json({
+      ok: true,
+      title: "Media siap dicoba",
+      thumbnail: null,
+      slides: [],
+      provider: "none"
+    })
+  } catch (error) {
+    return res.status(422).json({
+      ok: false,
+      error: simplifyError(error?.message || "Inspect gagal.")
+    })
+  }
+})
+
+app.post("/api/download-slide", async (req, res) => {
+  try {
+    const auth = req.headers.authorization || ""
+    const requiredToken = process.env.WORKER_TOKEN || ""
+
+    if (requiredToken && auth !== `Bearer ${requiredToken}`) {
+      return res.status(401).json({ ok: false, error: "Unauthorized worker token." })
+    }
+
+    if (!allowRequest(getClientKey(req))) {
+      return res.status(429).json({
+        ok: false,
+        error: "Terlalu banyak request. Tunggu sebentar lalu coba lagi."
+      })
+    }
+
+    cleanupOldFiles()
+
+    const slideUrl = normalizeUrl(req.body?.slideUrl)
+    const slideIndex = Number(req.body?.index || 0)
+    const preferredName = sanitizeFilename(req.body?.filename || `slide-${slideIndex + 1}`)
+
+    if (!slideUrl) {
+      return res.status(400).json({ ok: false, error: "URL slide tidak valid." })
+    }
+
+    const jobId = nanoid(10)
+    const sourceExt = guessExtFromUrl(slideUrl, "jpg")
+    const sourceFile = join(downloadDir, `${jobId}-slide-${slideIndex + 1}.${sourceExt}`)
+
+    await downloadDirectFile(slideUrl, sourceFile)
+
+    if (!existsSync(sourceFile) || statSync(sourceFile).size < 512) {
+      safeRemove(sourceFile)
+      return res.status(422).json({
+        ok: false,
+        error: "Slide gagal diambil atau file kosong."
+      })
+    }
+
+    const finalName = ensureFilenameExt(preferredName, extname(sourceFile).replace(".", "") || sourceExt)
+    const finalFile = join(downloadDir, `${jobId}-${finalName}`)
+
+    if (finalFile !== sourceFile) {
+      rmSync(finalFile, { force: true })
+      await moveFile(sourceFile, finalFile)
+    }
+
+    const downloadUrl = `${getPublicBase(req)}/files/${encodeURIComponent(basename(finalFile))}`
+
+    return res.json({
+      ok: true,
+      title: basename(finalFile),
+      mediaGroup: "photo",
+      quality: "original",
+      fileType: extname(finalFile).replace(".", "").toLowerCase() || sourceExt,
+      downloadUrl
+    })
+  } catch (error) {
+    return res.status(422).json({
+      ok: false,
+      error: simplifyError(error?.message || "Download slide gagal.")
+    })
+  }
+})
+
+app.post("/api/download-slides", async (req, res) => {
+  try {
+    const auth = req.headers.authorization || ""
+    const requiredToken = process.env.WORKER_TOKEN || ""
+
+    if (requiredToken && auth !== `Bearer ${requiredToken}`) {
+      return res.status(401).json({ ok: false, error: "Unauthorized worker token." })
+    }
+
+    if (!allowRequest(getClientKey(req))) {
+      return res.status(429).json({
+        ok: false,
+        error: "Terlalu banyak request. Tunggu sebentar lalu coba lagi."
+      })
+    }
+
+    cleanupOldFiles()
+
+    const rawSlides = Array.isArray(req.body?.slides) ? req.body.slides : []
+    const slides = rawSlides
+      .map((item, index) => ({
+        index,
+        url: normalizeUrl(item?.url),
+        filename: sanitizeFilename(item?.filename || `slide-${index + 1}`)
+      }))
+      .filter((item) => Boolean(item.url))
+      .slice(0, 30)
+
+    if (!slides.length) {
+      return res.status(400).json({ ok: false, error: "Tidak ada slide yang bisa diunduh." })
+    }
+
+    const jobId = nanoid(10)
+    const zipPath = join(downloadDir, `${jobId}-slides.zip`)
+    const tempFiles = []
+
+    const archive = archiver("zip", { zlib: { level: 9 } })
+    const output = createWriteStream(zipPath)
+
+    const finished = new Promise((resolve, reject) => {
+      output.on("close", resolve)
+      output.on("error", reject)
+      archive.on("error", reject)
+    })
+
+    archive.pipe(output)
+
+    for (const slide of slides) {
+      try {
+        const ext = guessExtFromUrl(slide.url, "jpg")
+        const tempFile = join(downloadDir, `${jobId}-part-${slide.index + 1}.${ext}`)
+        await downloadDirectFile(slide.url, tempFile)
+
+        if (existsSync(tempFile) && statSync(tempFile).size >= 512) {
+          tempFiles.push(tempFile)
+          const zipName = ensureFilenameExt(`slide-${slide.index + 1}-${slide.filename}`, ext)
+          archive.file(tempFile, { name: zipName })
+        } else {
+          safeRemove(tempFile)
+        }
+      } catch {
+        // Skip failed slide, continue remaining slides.
+      }
+    }
+
+    await archive.finalize()
+    await finished
+
+    for (const file of tempFiles) {
+      safeRemove(file)
+    }
+
+    if (!existsSync(zipPath) || statSync(zipPath).size < 512) {
+      safeRemove(zipPath)
+      return res.status(422).json({
+        ok: false,
+        error: "ZIP slide gagal dibuat karena semua slide gagal diambil."
+      })
+    }
+
+    const downloadUrl = `${getPublicBase(req)}/files/${encodeURIComponent(basename(zipPath))}`
+
+    return res.json({
+      ok: true,
+      title: basename(zipPath),
+      mediaGroup: "photo",
+      quality: "all-slides",
+      fileType: "zip",
+      downloadUrl
+    })
+  } catch (error) {
+    return res.status(422).json({
+      ok: false,
+      error: simplifyError(error?.message || "Download semua slide gagal.")
+    })
+  }
+})
 
 app.post("/api/download", async (req, res) => {
   try {
@@ -1282,6 +1490,231 @@ function getYouTubeVideoId(value) {
     return null
   }
 }
+
+async function inspectWithCobalt(url) {
+  const baseUrl = process.env.COBALT_API_URL
+
+  if (!baseUrl) {
+    return null
+  }
+
+  try {
+    const response = await fetch(baseUrl.replace(/\/$/, "") + "/", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        ...(process.env.COBALT_API_KEY ? { authorization: `Api-Key ${process.env.COBALT_API_KEY}` } : {})
+      },
+      body: JSON.stringify({
+        url,
+        filenameStyle: "basic",
+        disableMetadata: false,
+        alwaysProxy: true,
+        localProcessing: "preferred",
+        downloadMode: "auto",
+        convertGif: true,
+        tiktokFullAudio: true
+      })
+    })
+
+    const data = await response.json().catch(() => null)
+
+    if (!response.ok || !data || data.status === "error") {
+      return null
+    }
+
+    if (data.status === "picker") {
+      const picker = Array.isArray(data.picker) ? data.picker : []
+      const slides = picker
+        .map((item, index) => mapCobaltPickerToSlide(item, index))
+        .filter((item) => Boolean(item.url))
+
+      const thumbnail = slides.find((item) => item.thumbnail)?.thumbnail || null
+
+      return {
+        ok: true,
+        provider: "cobalt-picker",
+        title: data.filename || (slides.length > 1 ? `${slides.length} slide terdeteksi` : "Media siap dicoba"),
+        thumbnail,
+        slides
+      }
+    }
+
+    if ((data.status === "redirect" || data.status === "tunnel") && data.url) {
+      const type = normalizeSlideType(detectDirectMedia(data.url) || "video")
+      const ext = guessExtFromUrl(data.url, type === "photo" ? "jpg" : "mp4")
+
+      return {
+        ok: true,
+        provider: "cobalt-single",
+        title: data.filename || `media.${ext}`,
+        thumbnail: type === "photo" ? data.url : null,
+        slides: [{
+          index: 0,
+          type,
+          url: data.url,
+          thumbnail: type === "photo" ? data.url : null,
+          filename: data.filename || `media.${ext}`
+        }]
+      }
+    }
+
+    return null
+  } catch {
+    return null
+  }
+}
+
+function mapCobaltPickerToSlide(item, index) {
+  const type = normalizeSlideType(item?.type || detectDirectMedia(item?.url || "") || "photo")
+  const url = item?.url || item?.downloadUrl || ""
+  const ext = guessExtFromUrl(url, type === "video" ? "mp4" : "jpg")
+  const filename = sanitizeFilename(item?.filename || `slide-${index + 1}.${ext}`)
+  const thumbnail = item?.thumb || item?.thumbnail || (type === "photo" || type === "gif" ? url : null)
+
+  return {
+    index,
+    type,
+    url,
+    thumbnail,
+    filename
+  }
+}
+
+async function inspectWithYtDlp(url) {
+  const jobId = nanoid(8)
+  const outputTemplate = join(downloadDir, `${jobId}-inspect.%(ext)s`)
+
+  try {
+    const result = await runForOutput("yt-dlp", [
+      ...ytDlpBaseArgs(outputTemplate),
+      "--dump-single-json",
+      "--skip-download",
+      url
+    ], 120000)
+
+    const info = JSON.parse(result.stdout || "{}")
+    const entries = Array.isArray(info.entries) && info.entries.length ? info.entries : [info]
+    const slides = entries
+      .map((entry, index) => mapYtDlpEntryToSlide(entry, index))
+      .filter((item) => Boolean(item.url || item.thumbnail))
+
+    const thumbnail = getBestThumbnail(info) ||
+      slides.find((item) => item.thumbnail)?.thumbnail ||
+      null
+
+    return {
+      ok: true,
+      provider: "yt-dlp-info",
+      title: info.title || (slides.length > 1 ? `${slides.length} slide terdeteksi` : "Media siap dicoba"),
+      thumbnail,
+      slides
+    }
+  } catch {
+    return null
+  }
+}
+
+function mapYtDlpEntryToSlide(entry, index) {
+  const thumbnail = getBestThumbnail(entry)
+  const mediaUrl = getEntryMediaUrl(entry)
+  const type = inferYtDlpEntryType(entry, mediaUrl)
+  const ext = guessExtFromUrl(mediaUrl || thumbnail || "", type === "video" ? "mp4" : "jpg")
+  const finalUrl = mediaUrl || thumbnail
+
+  return {
+    index,
+    type,
+    url: finalUrl,
+    thumbnail: thumbnail || (type === "photo" ? finalUrl : null),
+    filename: sanitizeFilename(entry?.title || `slide-${index + 1}.${ext}`)
+  }
+}
+
+function getEntryMediaUrl(entry) {
+  if (!entry) return null
+
+  const requested = Array.isArray(entry.requested_downloads) ? entry.requested_downloads[0]?.url : null
+  const url = requested || entry.url || entry.original_url || null
+
+  if (typeof url === "string" && isPublicHttpUrl(url)) return url
+
+  return null
+}
+
+function getBestThumbnail(info) {
+  if (!info) return null
+
+  if (typeof info.thumbnail === "string" && isPublicHttpUrl(info.thumbnail)) {
+    return info.thumbnail
+  }
+
+  const thumbnails = Array.isArray(info.thumbnails) ? info.thumbnails : []
+  const sorted = thumbnails
+    .filter((item) => typeof item.url === "string" && isPublicHttpUrl(item.url))
+    .sort((a, b) => Number(b.width || 0) - Number(a.width || 0))
+
+  return sorted[0]?.url || null
+}
+
+function inferYtDlpEntryType(entry, mediaUrl) {
+  const ext = String(entry?.ext || guessExtFromUrl(mediaUrl || "", "")).toLowerCase()
+
+  if (PHOTO_TYPES.includes(ext)) return "photo"
+  if (VIDEO_TYPES.includes(ext)) return "video"
+  if (AUDIO_TYPES.includes(ext)) return "audio"
+
+  if (entry?.vcodec && entry.vcodec !== "none") return "video"
+  if (entry?.acodec && entry.acodec !== "none") return "audio"
+
+  return "photo"
+}
+
+function normalizeSlideType(value) {
+  const type = String(value || "").toLowerCase()
+  if (type === "image" || type === "photo" || type === "gif") return "photo"
+  if (type === "video") return "video"
+  if (type === "audio") return "audio"
+  return "photo"
+}
+
+function guessExtFromUrl(value, fallback = "jpg") {
+  try {
+    const clean = new URL(value).pathname.toLowerCase()
+    const ext = extname(clean).replace(".", "").split("?")[0]
+    if ([...PHOTO_TYPES, ...VIDEO_TYPES, ...AUDIO_TYPES, "zip"].includes(ext)) return ext
+    return fallback
+  } catch {
+    return fallback
+  }
+}
+
+function ensureFilenameExt(filename, ext) {
+  const clean = sanitizeFilename(filename || "slide")
+  const wanted = String(ext || "jpg").replace(".", "").toLowerCase()
+  const current = extname(clean).replace(".", "").toLowerCase()
+
+  if (current) return clean
+  return `${clean}.${wanted}`
+}
+
+async function moveFile(source, target) {
+  const data = await import("node:fs/promises")
+  await data.rename(source, target)
+}
+
+function isPublicHttpUrl(value) {
+  try {
+    const parsed = new URL(String(value || ""))
+    if (!["http:", "https:"].includes(parsed.protocol)) return false
+    if (isPrivateHost(parsed.hostname)) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
 
 function normalizeMediaGroup(value) {
   const mediaGroup = String(value || "video").toLowerCase()

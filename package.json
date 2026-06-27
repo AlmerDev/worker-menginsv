@@ -1,6 +1,6 @@
 {
   "name": "menginasv-cobalt-ready-worker",
-  "version": "5.6.0",
+  "version": "5.8.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "helmet": "^7.1.0",
-    "nanoid": "^5.0.7"
+    "nanoid": "^5.0.7",
+    "archiver": "^7.0.1"
   }
 }
