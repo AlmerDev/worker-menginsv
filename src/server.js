@@ -33,7 +33,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "server-connect stability + auto-detect clean carousel + cobalt + yt-dlp + ffmpeg + deno",
+    engine: "tiktok-photo detection + clean photo mode + server-connect stability + cobalt + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
