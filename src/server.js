@@ -33,7 +33,7 @@ app.get("/health", (_, res) => {
     ok: true,
     mode: "cobalt-ready",
     service: "menginasv-worker",
-    engine: "auto-detect clean carousel + per-slide direct download + cobalt + yt-dlp + ffmpeg + deno",
+    engine: "server-connect stability + auto-detect clean carousel + cobalt + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
