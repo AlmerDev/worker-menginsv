@@ -1,6 +1,6 @@
 {
   "name": "menginasv-cobalt-ready-worker",
-  "version": "5.9.0-accurate-detector",
+  "version": "5.9.1-tiktok-photo-extractor",
   "private": true,
   "type": "module",
   "scripts": {
