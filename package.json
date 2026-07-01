@@ -1,6 +1,6 @@
 {
   "name": "menginasv-cobalt-ready-worker",
-  "version": "5.8.0",
+  "version": "7.1.0-more-platforms-apify",
   "private": true,
   "type": "module",
   "scripts": {
