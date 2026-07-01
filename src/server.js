@@ -4,7 +4,7 @@ import helmet from "helmet"
 import { nanoid } from "nanoid"
 import archiver from "archiver"
 import { spawn } from "node:child_process"
-import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs"
+import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { basename, extname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 8080
 const __dirname = fileURLToPath(new URL(".", import.meta.url))
 const rootDir = join(__dirname, "..")
 const downloadDir = join(rootDir, "downloads")
+const cookiesFilePath = join(rootDir, "cookies.txt")
 
 const VIDEO_TYPES = ["mp4", "webm", "mkv", "mov", "avi", "m4v", "3gp", "flv"]
 const AUDIO_TYPES = ["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "webm"]
@@ -23,6 +24,8 @@ const rateStore = new Map()
 if (!existsSync(downloadDir)) {
   mkdirSync(downloadDir, { recursive: true })
 }
+
+setupYtDlpCookies()
 
 app.use(helmet({ crossOriginResourcePolicy: false }))
 app.use(cors())
@@ -35,6 +38,7 @@ app.get("/health", (_, res) => {
     service: "menginasv-worker",
     engine: "carousel slides + per-slide download + zip all slides + cobalt + yt-dlp + ffmpeg + deno",
     cobaltEnabled: Boolean(process.env.COBALT_API_URL),
+    ytDlpCookiesEnabled: hasYtDlpCookies(),
     videoTypes: VIDEO_TYPES,
     audioTypes: AUDIO_TYPES,
     photoTypes: PHOTO_TYPES
@@ -927,8 +931,43 @@ async function processPhoto({ url, jobId, fileType }) {
   return existsSync(target) ? target : null
 }
 
+function setupYtDlpCookies() {
+  const cookiesB64 = process.env.YTDLP_COOKIES_B64 || process.env.INSTAGRAM_COOKIES_B64 || ""
+  const cookiesRaw = process.env.YTDLP_COOKIES || process.env.INSTAGRAM_COOKIES || ""
+
+  if (!cookiesB64 && !cookiesRaw) return
+
+  try {
+    const content = cookiesB64
+      ? Buffer.from(cookiesB64, "base64").toString("utf8")
+      : String(cookiesRaw).replace(/\\n/g, "\n")
+
+    if (!content.includes("instagram.com") && !content.includes(".instagram.com")) {
+      console.warn("YTDLP cookies configured, but no instagram.com cookie domain found.")
+    }
+
+    writeFileSync(cookiesFilePath, content, { mode: 0o600 })
+    console.log("yt-dlp cookies file ready.")
+  } catch (error) {
+    console.warn("Failed to write yt-dlp cookies file:", error?.message || error)
+  }
+}
+
+function getYtDlpCookiesPath() {
+  const explicit = process.env.YTDLP_COOKIES_PATH || process.env.INSTAGRAM_COOKIES_PATH || ""
+
+  if (explicit && existsSync(explicit)) return explicit
+  if (existsSync(cookiesFilePath)) return cookiesFilePath
+
+  return null
+}
+
+function hasYtDlpCookies() {
+  return Boolean(getYtDlpCookiesPath())
+}
+
 function ytDlpBaseArgs(outputTemplate) {
-  return [
+  const args = [
     "--no-playlist",
     "--restrict-filenames",
     "--windows-filenames",
@@ -939,9 +978,17 @@ function ytDlpBaseArgs(outputTemplate) {
     "--sleep-requests", "1",
     "--sleep-interval", "1",
     "--max-sleep-interval", "3",
-    "--js-runtimes", "deno",
-    "--output", outputTemplate
+    "--js-runtimes", "deno"
   ]
+
+  const cookiesPath = getYtDlpCookiesPath()
+  if (cookiesPath) {
+    args.push("--cookies", cookiesPath)
+  }
+
+  args.push("--output", outputTemplate)
+
+  return args
 }
 
 function buildVideoConvertArgs(source, target, fileType) {
@@ -1833,8 +1880,17 @@ function simplifyError(message) {
     return "Platform atau link belum didukung engine."
   }
 
-  if (lower.includes("private") || lower.includes("login")) {
-    return "Konten private atau butuh login tidak bisa diproses."
+  if (
+    lower.includes("empty media response") ||
+    lower.includes("cookies-from-browser") ||
+    lower.includes("--cookies") ||
+    lower.includes("login required") ||
+    lower.includes("login") ||
+    lower.includes("private")
+  ) {
+    return hasYtDlpCookies()
+      ? "Instagram tetap menolak media ini meskipun cookies sudah aktif. Link kemungkinan private, region/login wall, atau cookies sudah expired."
+      : "Instagram menolak media ini karena butuh login/cookies. Untuk IG tertentu, aktifkan YTDLP_COOKIES_B64 di Worker atau coba link yang benar-benar public."
   }
 
   if (lower.includes("drm")) {
